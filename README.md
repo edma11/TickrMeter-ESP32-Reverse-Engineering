@@ -33,8 +33,18 @@ Hardware revisions may differ. Verify the PCB before using these pin assignments
 | RGB LED blue | GPIO21 | **Active LOW** |
 | Buzzer / amplifier STBY | GPIO17 | HIGH = ON |
 | Audio signal | GPIO25 | Tone / audio drive |
+| Battery divider ADC | GPIO32 | ADC1_CH4; battery voltage through an approximately 10 kΩ / 10 kΩ divider |
+| USB divider ADC | GPIO33 | ADC1_CH5; USB supply voltage, approximately 5 V after divider compensation |
+| Divider enable | GPIO4 | HIGH = enable measurement; LOW = disable, including deep sleep |
 
 More details: [`docs/pinout.md`](docs/pinout.md)
+
+Battery ADC findings and measurements: [`docs/battery-adc.md`](docs/battery-adc.md).
+On **2026-10-11**, the hardware owner confirmed the updated clock working:
+GPIO32 measures the battery when GPIO4 is HIGH, and GPIO33 measures the USB
+supply (approximately 5 V after divider compensation). The dividers are
+nominally approximately 10 kΩ / 10 kΩ; use a starting conversion factor of 2.000
+and calibrate each channel independently against a multimeter.
 
 ## Examples
 
@@ -67,6 +77,16 @@ More complete demo with:
 - alarm settings
 - OTA firmware upload
 - NTP clock
+- web/AP/OTA available for 5 minutes after reset; timer wakes do not reopen it
+- deep sleep between minute updates and hourly NTP synchronization
+- Lithuanian web UI, validated settings, OTA upload progress and revised display layout
+- battery voltage and four charge bars at the upper left of the display
+- GPIO32/GPIO33 selection, separate saved calibration per channel and adjustable empty/full voltage limits
+
+Hardware owner reported the updated clock working on 2026-10-11.
+Choose GPIO32 for actual battery charge; GPIO33 measures USB supply voltage.
+
+Setup, display refresh limits, and hardware checks: [`clock README`](examples/TickrMeter_Clock_Web_Settings_OTA/README.md).
 
 The Wi-Fi credentials in this public repository are placeholders. Enter your own values or configure them through the web interface.
 

@@ -5,7 +5,7 @@
 */
 
 /*
-  TickrMeter Rev 1.6 - NTP CLOCK + WEB SETTINGS
+  TickrMeter Rev 1.6 - NTP CLOCK + WEB SETTINGS + DEEP SLEEP
   ESP32-WROOM-32E + 2.9" e-paper
 
   Web settings:
@@ -17,6 +17,9 @@
     - OTA firmware upload
 
   Settings are saved in ESP32 NVS using Preferences and survive reboot.
+  Web/AP/OTA: 5 minutes after RESET/power-on/software restart only.
+  Timer wake: radio off except hourly NTP; redraw once per minute.
+  GxEPD2_290_C90c uses full refresh (~27 seconds); no fast partial refresh.
 
   Confirmed TickrMeter pinout:
     EPD_POWER / EN = GPIO19   ACTIVE LOW: LOW=ON, HIGH=OFF
@@ -47,6 +50,12 @@
 #include <SPI.h>
 #include <time.h>
 #include <Preferences.h>
+#include <esp_sleep.h>
+#include <esp_sntp.h>
+#include <driver/gpio.h>
+#include <sys/time.h>
+#include <math.h>
+#include "ClockLogic.h"
 
 #include <GxEPD2_3C.h>
 #include <Fonts/FreeSans9pt7b.h>
@@ -59,8 +68,8 @@
 
 // Existing Wi-Fi from the old sketch is used only as FIRST-BOOT default.
 // After saving through the web page, NVS settings take priority.
-const char* DEFAULT_WIFI_SSID = "YOUR_WIFI_SSID";
-const char* DEFAULT_WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* DEFAULT_WIFI_SSID = "";
+const char* DEFAULT_WIFI_PASS = "";
 
 const char* OTA_AP_SSID = "TickrMeter-CUSTOM";
 const char* OTA_AP_PASS = "12345678";
@@ -86,6 +95,24 @@ const char* TZ_LT = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 #define BUZZER_STBY 17
 #define AUDIO_PIN   25
+
+// Confirmed battery divider: GPIO32 ADC1, 10k/10k; GPIO4 HIGH enables it.
+// User confirmed GPIO4 may be switched off. HIGH only while measuring;
+// LOW between measurements and held LOW throughout deep sleep.
+constexpr uint8_t PIN_BAT_EN = 4;
+constexpr float BAT_DIVIDER_FACTOR = 2.000f;
+const uint8_t BAT_ADC_PINS[] = {32, 33};
+uint8_t batteryPin = 32;
+float batteryCorrection[2] = {1.0f, 1.0f};
+float batteryEmptyV = 3.0f, batteryFullV = 4.2f;
+uint16_t batteryRaw[2] = {0, 0};
+uint32_t batteryNominalMv[2] = {0, 0};
+bool batteryChannelValid[2] = {false, false};
+uint32_t batterySampleId = 0, batterySampleAt = 0;
+bool batterySampleRequested = false;
+uint32_t batteryMilliVolts = 0;
+bool batteryValid = false;
+int batteryPercent = -1;
 
 // ============================================================
 // DISPLAY
@@ -129,8 +156,23 @@ int alarmMinute = 0;
 // Alarm sounds for this many seconds.
 int alarmDurationSec = 20;
 
-int lastShownMinute = -1;
-int lastAlarmStamp = -1;
+const uint32_t WEB_WINDOW_MS = ClockLogic::windowMs;
+const time_t VALID_TIME = 1700000000;
+RTC_DATA_ATTR time_t lastShownStamp = 0;
+RTC_DATA_ATTR int lastAlarmDay = -1;
+RTC_DATA_ATTR time_t lastNtpSync = 0;
+bool webActive = false, uploadActive = false, uploadOK = false;
+bool refreshRequested = false, restartPending = false;
+bool drawing = false;
+uint32_t webStarted = 0, uploadActivity = 0, restartAt = 0;
+uint32_t alarmStarted = 0, alarmLength = 0;
+bool alarmRunning = false;
+volatile bool ntpSynced = false;
+String screenTitle = "KUPISKIS";
+String alarmTimeString();
+void serviceWeb();
+void stopWeb();
+void serviceAlarm();
 unsigned long lastReconnectTry = 0;
 
 // ============================================================
@@ -152,6 +194,20 @@ void loadSettings()
   alarmMinute = prefs.getInt("alarmM", 0);
   alarmDurationSec = prefs.getInt("alarmSec", 20);
 
+  batteryPin = prefs.getUChar("batPin", 32);
+  if (batteryPin != 32 && batteryPin != 33) batteryPin = 32;
+  batteryCorrection[0] = prefs.getFloat("batCal32", 1.0f);
+  batteryCorrection[1] = prefs.getFloat("batCal33", 1.0f);
+  for (float& factor : batteryCorrection)
+    if (!isfinite(factor) || factor < 0.25f || factor > 4.0f) factor = 1.0f;
+  batteryEmptyV = prefs.getFloat("batEmpty", 3.0f);
+  batteryFullV = prefs.getFloat("batFull", 4.2f);
+  if (!isfinite(batteryEmptyV) || !isfinite(batteryFullV) || batteryEmptyV < 2.0f
+      || batteryFullV > 6.0f || lroundf(batteryFullV*1000)-lroundf(batteryEmptyV*1000) < 100) {
+    batteryEmptyV = 3.0f; batteryFullV = 4.2f;
+  }
+
+  screenTitle = prefs.getString("title", "KUPISKIS");
   alarmHour = constrain(alarmHour, 0, 23);
   alarmMinute = constrain(alarmMinute, 0, 59);
   alarmDurationSec = constrain(alarmDurationSec, 5, 120);
@@ -159,6 +215,7 @@ void loadSettings()
 
 void saveSettings()
 {
+  prefs.putString("title", screenTitle);
   prefs.putString("ssid", wifiSsid);
   prefs.putString("pass", wifiPass);
 
@@ -262,42 +319,31 @@ void shortMinuteBeep()
 // Automatic alarm. Alarm is independent from minuteBeepEnabled.
 void runAlarm(int durationSec)
 {
-  unsigned long endAt = millis() + (unsigned long)durationSec * 1000UL;
-  bool phase = false;
+  if (alarmRunning) return;
+  alarmStarted = millis();
+  alarmLength = (uint32_t)durationSec * 1000;
+  alarmRunning = true;
+}
 
-  while ((long)(endAt - millis()) > 0)
-  {
-    phase = !phase;
-
-    if (ledEnabled)
-    {
-      if (phase) ledSet(true, false, false);
-      else ledsOff();
-    }
-
-    digitalWrite(BUZZER_STBY, HIGH);
-    delay(8);
-
-    tone(AUDIO_PIN, phase ? 1900 : 2400);
-    delay(120);
-    noTone(AUDIO_PIN);
-
-    digitalWrite(AUDIO_PIN, LOW);
-    digitalWrite(BUZZER_STBY, LOW);
-
-    // Keep the settings / OTA web server responsive during alarm.
-    unsigned long pauseStart = millis();
-    while (millis() - pauseStart < 260)
-    {
-      server.handleClient();
-      delay(5);
-    }
-  }
-
+void stopAlarm()
+{
   noTone(AUDIO_PIN);
   digitalWrite(AUDIO_PIN, LOW);
   digitalWrite(BUZZER_STBY, LOW);
   ledsOff();
+  alarmRunning = false;
+}
+
+void serviceAlarm()
+{
+  if (!alarmRunning) return;
+  uint32_t elapsed = millis() - alarmStarted;
+  if (elapsed >= alarmLength) { stopAlarm(); return; }
+  bool on = elapsed % 400 < 140;
+  digitalWrite(BUZZER_STBY, on ? HIGH : LOW);
+  if (on) tone(AUDIO_PIN, ((elapsed / 400) % 2) ? 2400 : 1900);
+  else { noTone(AUDIO_PIN); digitalWrite(AUDIO_PIN, LOW); }
+  ledSet(on, false, false);
 }
 
 // ============================================================
@@ -385,7 +431,7 @@ void drawColon(int x, int y)
 void drawBigTime(int hour, int minute)
 {
   const int y = 30;
-  const int x0 = 37;
+  const int x0 = (display.width() - 197) / 2;
 
   drawDigit(x0,       y, hour / 10);
   drawDigit(x0 + 47,  y, hour % 10);
@@ -399,6 +445,77 @@ void drawBigTime(int hour, int minute)
 // ============================================================
 // SMALL ICONS / FOOTER
 // ============================================================
+
+void initBattery()
+{
+  pinMode(PIN_BAT_EN, OUTPUT);
+  digitalWrite(PIN_BAT_EN, LOW);
+  gpio_hold_dis((gpio_num_t)PIN_BAT_EN);
+  analogReadResolution(12);
+  for (uint8_t pin : BAT_ADC_PINS) {
+    pinMode(pin, INPUT);
+    analogSetPinAttenuation(pin, ADC_11db);
+  }
+  digitalWrite(PIN_BAT_EN, LOW);
+}
+
+void updateBatteryValue()
+{
+  int channel = batteryPin == 33 ? 1 : 0;
+  batteryValid = batteryChannelValid[channel];
+  batteryMilliVolts = (uint32_t)(batteryNominalMv[channel] * batteryCorrection[channel] + 0.5f);
+  batteryPercent = batteryValid ? ClockLogic::chargePercent(batteryMilliVolts,
+    (uint32_t)lroundf(batteryEmptyV*1000), (uint32_t)lroundf(batteryFullV*1000)) : -1;
+}
+
+void sampleBattery()
+{
+  // One averaged measurement per frame, before LED/display load is enabled.
+  // RAW and calibrated mV are independent conversions, as in the v2.3 test.
+  digitalWrite(PIN_BAT_EN, HIGH);
+  delay(150); // Divider settling after every enable, including timer wakes.
+  for (int channel = 0; channel < 2; ++channel) {
+    uint8_t pin = BAT_ADC_PINS[channel];
+    (void)analogRead(pin);
+    uint32_t rawSum = 0, mvSum = 0;
+    for (int i = 0; i < 16; ++i) {
+      rawSum += analogRead(pin);
+      mvSum += analogReadMilliVolts(pin);
+      delayMicroseconds(150);
+    }
+    batteryRaw[channel] = (rawSum + 8) / 16;
+    uint32_t adcMv = (mvSum + 8) / 16;
+    batteryNominalMv[channel] = (uint32_t)(adcMv * BAT_DIVIDER_FACTOR + 0.5f);
+    batteryChannelValid[channel] = batteryRaw[channel] > 8 && batteryRaw[channel] < 4080 && adcMv > 0;
+  }
+  digitalWrite(PIN_BAT_EN, LOW);
+  ++batterySampleId; batterySampleAt = millis();
+  updateBatteryValue();
+}
+
+void drawBattery()
+{
+  display.drawRect(6, 7, 22, 12, GxEPD_BLACK);
+  display.fillRect(28, 10, 3, 6, GxEPD_BLACK);
+  if (batteryValid) {
+    int bars = ClockLogic::batteryBars(batteryPercent);
+    for (int i = 0; i < bars; ++i) display.fillRect(9 + i * 4, 10, 3, 6, GxEPD_BLACK);
+  } else {
+    display.setFont(nullptr); display.setTextSize(1);
+    display.setCursor(14, 9); display.print("?");
+  }
+  display.setFont(&FreeSans9pt7b);
+  display.setCursor(36, 19);
+  if (batteryValid) {
+    char voltage[12];
+    uint32_t hundredths = (batteryMilliVolts + 5) / 10;
+    snprintf(voltage, sizeof(voltage), "%lu.%02lu V",
+             (unsigned long)(hundredths / 100), (unsigned long)(hundredths % 100));
+    display.print(voltage);
+  } else {
+    display.print("--.-- V");
+  }
+}
 
 void drawWifiSimple(int x, int y, bool connected)
 {
@@ -418,24 +535,41 @@ void drawWifiSimple(int x, int y, bool connected)
   display.drawLine(x + 6, y + 1, x + 12, y + 5, GxEPD_BLACK);
 }
 
-void drawBatteryOutline(int x, int y)
-{
-  display.drawRect(x, y, 24, 12, GxEPD_BLACK);
-  display.fillRect(x + 24, y + 3, 3, 6, GxEPD_BLACK);
-
-  // Placeholder until GPIO34 battery calibration is final.
-  display.fillRect(x + 3, y + 3, 9, 6, GxEPD_BLACK);
-}
-
 const char* weekdayName(int wday)
 {
-  static const char* names[] =
-  {
-    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
-  };
+  static const char* names[] = {"Sek", "Pir", "Ant", "Tre", "Ket", "Pen", "Ses"};
+  return (wday >= 0 && wday <= 6) ? names[wday] : "---";
+}
 
-  if (wday < 0 || wday > 6) return "---";
-  return names[wday];
+void centeredText(const String& text, int left, int right, int baseline, const GFXfont* font)
+{
+  display.setFont(font);
+  int16_t x, y; uint16_t w, h;
+  display.getTextBounds(text, 0, baseline, &x, &y, &w, &h);
+  display.setCursor(left + (right - left - (int)w) / 2 - x, baseline);
+  display.print(text);
+}
+
+void drawHeader()
+{
+  drawBattery();
+  // Retain older saved titles without letting them overlap the battery.
+  String title = screenTitle;
+  display.setFont(&FreeSansBold9pt7b);
+  int16_t x, y; uint16_t w, h;
+  display.getTextBounds(title, 0, 19, &x, &y, &w, &h);
+  if (w > 138) {
+    do {
+      title.remove(title.length() - 1);
+      display.getTextBounds(title + "...", 0, 19, &x, &y, &w, &h);
+    } while (w > 138 && title.length());
+    title += "...";
+  }
+  centeredText(title, 104, 242, 19, &FreeSansBold9pt7b);
+  display.setFont(nullptr); display.setTextSize(1);
+  display.setCursor(248, 9); display.print(webActive ? "W" : "R");
+  drawWifiSimple(276, 3, WiFi.status() == WL_CONNECTED);
+  display.drawLine(5, 24, 291, 24, GxEPD_BLACK);
 }
 
 // ============================================================
@@ -444,6 +578,8 @@ const char* weekdayName(int wday)
 
 void drawClock(const struct tm& t)
 {
+  drawing = true;
+  sampleBattery();
   ledSet(false, false, true);
 
   epdPowerOn();
@@ -453,6 +589,8 @@ void drawClock(const struct tm& t)
   display.init(115200);
   display.setRotation(3);
   display.setFullWindow();
+  display.setTextWrap(false);
+  display.epd2.setBusyCallback([](const void*) { serviceWeb(); serviceAlarm(); delay(1); });
 
   display.firstPage();
 
@@ -460,14 +598,8 @@ void drawClock(const struct tm& t)
   {
     display.fillScreen(GxEPD_WHITE);
 
-    display.setFont(&FreeSansBold12pt7b);
     display.setTextColor(GxEPD_BLACK);
-    display.setCursor(7, 18);
-    display.print("TickrMeter");
-
-    drawWifiSimple(250, 3, WiFi.status() == WL_CONNECTED);
-
-    display.drawLine(5, 24, 291, 24, GxEPD_BLACK);
+    drawHeader();
 
     drawBigTime(t.tm_hour, t.tm_min);
 
@@ -483,36 +615,10 @@ void drawClock(const struct tm& t)
       t.tm_mday
     );
 
-    display.setFont(&FreeSans9pt7b);
-    display.setCursor(7, 123);
-    display.print(dateBuf);
-
-    display.setFont(&FreeSansBold9pt7b);
-    display.setCursor(118, 123);
-    display.print(weekdayName(t.tm_wday));
-
-    // Alarm state in footer.
-    display.setFont(&FreeSans9pt7b);
-    display.setCursor(163, 123);
-
-    if (alarmEnabled)
-    {
-      char alarmBuf[12];
-      snprintf(
-        alarmBuf,
-        sizeof(alarmBuf),
-        "A %02d:%02d",
-        alarmHour,
-        alarmMinute
-      );
-      display.print(alarmBuf);
-    }
-    else
-    {
-      display.print("A OFF");
-    }
-
-    drawBatteryOutline(262, 110);
+    centeredText(dateBuf, 4, 139, 122, &FreeSans9pt7b);
+    centeredText(weekdayName(t.tm_wday), 140, 183, 122, &FreeSansBold9pt7b);
+    String alarmText = alarmEnabled ? "A " + alarmTimeString() : "A --:--";
+    centeredText(alarmText, 185, 292, 122, &FreeSans9pt7b);
   }
   while (display.nextPage());
 
@@ -522,6 +628,7 @@ void drawClock(const struct tm& t)
   ledSet(false, true, false);
   delay(150);
   ledsOff();
+  drawing = false;
 }
 
 // ============================================================
@@ -551,13 +658,14 @@ void connectHomeWifi()
     millis() - start < 15000
   )
   {
-    server.handleClient();
+    serviceWeb();
     delay(200);
   }
 }
 
 void configureNtp()
 {
+  sntp_set_time_sync_notification_cb([](struct timeval*) { ntpSynced = true; });
   configTzTime(
     TZ_LT,
     "pool.ntp.org",
@@ -572,9 +680,9 @@ bool waitForTime(unsigned long timeoutMs)
 
   while (millis() - start < timeoutMs)
   {
-    server.handleClient();
+    serviceWeb();
 
-    if (time(nullptr) > 1700000000)
+    if (ntpSynced)
       return true;
 
     delay(100);
@@ -631,506 +739,355 @@ String currentTimeString()
   return String(b);
 }
 
-// ============================================================
-// WEB UI
-// ============================================================
+// All actions are queued; handlers never call handleClient recursively.
+const char PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="lt"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TickrMeter laikrodis</title><style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101724;color:#e8edf7}
+*{box-sizing:border-box}body{margin:0;padding:20px}main{max-width:680px;margin:auto}
+h1{font-size:28px}h2{font-size:19px;margin-top:0}section{background:#1b2638;border:1px solid #33435c;border-radius:16px;padding:22px;margin:16px 0}
+label{display:block;margin:14px 0 7px}input:not([type=checkbox]),select,button{font:inherit;padding:12px;border-radius:8px;border:1px solid #526581;width:100%;background:#101724;color:inherit}
+input[type=checkbox]{width:22px;height:22px;vertical-align:middle;margin-right:12px}
+button{background:#8ac9ff;color:#102035;border:0;cursor:pointer;margin-top:12px;font-weight:600}
+.row{display:flex;gap:12px}.row>*{flex:1;min-width:0}small,p{color:#bac8dc;line-height:1.5}.time{font-size:38px;font-variant-numeric:tabular-nums}
+progress{width:100%;height:18px}#message{white-space:pre-wrap}a{color:#8ac9ff}@media(max-width:440px){.row{display:block}}
+</style><main><h1>TickrMeter</h1><section><div class="time" id="clock">--:--:--</div>
+<p id="status">Skaitoma būsena…</p><p>Web ir OTA langas: <b id="remaining">—</b>. Langui pasibaigus laikrodis miega ir pabunda kas minutę. Norėdami vėl prisijungti, paspauskite RESET.</p></section>
+<form id="settings"><section><h2>Laikrodis ir garsas</h2>
+<label>Ekrano antraštė (iki 18 ASCII simbolių)</label><input name="title" maxlength="18" pattern="[ -~]{1,18}" value="%TITLE%" required>
+<small>Ekrano šriftai neturi lietuviškų raidžių: rašykite, pvz., KUPISKIS. Web puslapis palaiko lietuvių kalbą.</small>
+<label><input type="checkbox" name="led" %LED%>RGB efektai</label>
+<label><input type="checkbox" name="minbeep" %BEEP%>Pyptelėjimas kas minutę</label>
+<label><input type="checkbox" name="alarm" %ALARM%>Žadintuvas</label>
+<div class="row"><div><label>Žadintuvo laikas</label><input type="time" name="alarmtime" value="%TIME%" required></div>
+<div><label>Trukmė, sekundės</label><input type="number" name="alarmsec" min="5" max="120" value="%SECONDS%" required></div></div></section>
+<section><h2>Namų Wi-Fi</h2><label>Tinklo pavadinimas (SSID)</label><input name="ssid" maxlength="32" value="%SSID%">
+<label>Slaptažodis</label><input type="password" name="pass" maxlength="64" autocomplete="new-password" placeholder="Tuščias – išlaikyti esamą">
+<label><input type="checkbox" name="openwifi">Atviras tinklas (ištrinti slaptažodį)</label>
+<small>Tuščias SSID išjungia namų Wi-Fi. Išsaugojus Wi-Fi pakeitimai taikomi iškart; 5 min. langas nepratęsiamas.</small>
+<button>Išsaugoti nustatymus</button></section></form>
+<form id="battery"><section><h2>Baterija ir kalibravimas</h2>
+<p id="battery-status">Laukiama baterijos matavimo…</p>
+<label>Baterijos rodmens šaltinis</label><select name="pin" id="battery-pin"><option value="32" %PIN32%>GPIO32</option><option value="33" %PIN33%>GPIO33</option></select>
+<small>Pasirinkite kanalą, prijungtą prie baterijos. GPIO33 tinklo paskirtis automatiškai nenustatoma.</small>
+<div class="row"><div><label>Išmatuota be pataisos, V</label><input id="measured" readonly></div>
+<div><label>Po kalibravimo, V</label><input id="calibrated" readonly></div></div>
+<p id="calibration-info"></p><input type="hidden" name="sample" id="battery-sample" value="0">
+<button type="button" id="battery-measure">Pamatuoti iš naujo</button>
+<label>Tikra įtampa pagal multimetrą, V</label><input name="real" id="battery-real" type="number" step="0.001" min="2" max="6" placeholder="Pvz., 3.850">
+<small>Įveskite vienu metu multimetru pamatuotą įtampą. Tuščias laukas išlaiko esamą kalibravimą. Pataisa saugoma atskirai kiekvienam GPIO.</small>
+<div class="row"><div><label>Tuščia baterija (0 %), V</label><input name="empty" type="number" min="2" max="6" step="0.01" value="%EMPTY%" required></div>
+<div><label>Pilna baterija (100 %), V</label><input name="full" type="number" min="2" max="6" step="0.01" value="%FULL%" required></div></div>
+<small>4 padalos ir procentai apskaičiuojami apytiksliai, tiesiškai pagal šias ribas. Tai nėra tikslus baterijos talpos matavimas.</small>
+<button name="operation" value="apply">Išsaugoti šaltinį / kalibruoti</button>
+<button name="operation" value="reset" formnovalidate>Atkurti pasirinkto GPIO kalibravimą</button>
+</section></form>
+<section><h2>Patikra</h2><div class="row"><button type="button" data-action="led">RGB</button><button type="button" data-action="beep">Garsas</button><button type="button" data-action="alarm">Žadintuvas 3 s</button></div>
+<div class="row"><button type="button" data-action="stop">Nutildyti</button><button type="button" data-action="refresh">Atnaujinti ekraną</button></div>
+<small>Šio trispalvio ekrano atnaujinimas gali trukti apie 27 s.</small></section>
+<section><h2>OTA programinės įrangos atnaujinimas</h2><p>Pasirinkite šiam ESP32 sukompiliuotą programos .bin failą. Naudokite skaidinių lentelę su OTA. Įkėlimo metu įrenginys nemiega.</p>
+<form id="ota"><input type="file" name="update" accept=".bin" required><button>Įkelti .bin</button></form><progress id="progress" max="100" value="0"></progress></section>
+<p id="message" role="status" aria-live="polite"></p></main><script>
+const msg=document.querySelector('#message');let updating=false;
+let batteryState=null, calibrationLocked=false, sampleWaiting=false;
+function showBattery(s){batteryState=s;const channel=s.channels[document.querySelector('#battery-pin').value==='33'?1:0];
+document.querySelector('#battery-status').textContent='Ekranas: GPIO'+s.pin+' · '+(s.valid?(s.mv/1000).toFixed(2)+' V · apie '+s.percent+' %':'matavimas negalioja');
+if(calibrationLocked)return;
+document.querySelector('#measured').value=channel.valid?(channel.nominal/1000).toFixed(3):'Nežinoma';
+document.querySelector('#calibrated').value=channel.valid?(channel.corrected/1000).toFixed(3):'Nežinoma';
+document.querySelector('#battery-sample').value=s.id;
+document.querySelector('#calibration-info').textContent='Pataisos koeficientas: '+channel.factor.toFixed(5)+' · matavimo amžius '+Math.floor(s.age/1000)+' s.';
+}
+document.querySelector('#battery-pin').onchange=()=>{calibrationLocked=false;document.querySelector('#battery-real').value='';if(batteryState)showBattery(batteryState)};
+document.querySelector('#battery-real').oninput=()=>{calibrationLocked=Boolean(document.querySelector('#battery-real').value)};
+document.querySelector('#battery-measure').onclick=async()=>{try{calibrationLocked=false;sampleWaiting=true;await send('/action',new URLSearchParams({action:'battery-sample'}));}catch(e){msg.textContent=e.message;sampleWaiting=false}};
+document.querySelector('#battery').onsubmit=async e=>{e.preventDefault();try{if(sampleWaiting)throw Error('Palaukite naujo matavimo.');const data=new URLSearchParams(new FormData(e.target));data.set('operation',e.submitter?.value||'apply');await send('/battery/save',data);calibrationLocked=false;document.querySelector('#battery-real').value='';await status();}catch(e){msg.textContent=e.message}};
+async function send(url,body){const r=await fetch(url,{method:'POST',body});const t=await r.text();if(!r.ok)throw Error(t);msg.textContent=t;}
+document.querySelector('#settings').onsubmit=async e=>{e.preventDefault();try{await send('/save',new URLSearchParams(new FormData(e.target)))}catch(e){msg.textContent=e.message}};
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{try{await send('/action',new URLSearchParams({action:b.dataset.action}))}catch(e){msg.textContent=e.message}});
+async function status(){if(updating)return;try{const r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();const s=await r.json();document.querySelector('#clock').textContent=s.time;document.querySelector('#status').textContent=s.connected?'Wi-Fi prisijungęs · '+s.ip:'Wi-Fi neprisijungęs · laikas '+(s.valid?'išlaikomas RTC':'dar nesinchronizuotas');document.querySelector('#remaining').textContent=Math.floor(s.remaining/60)+':'+String(s.remaining%60).padStart(2,'0');if(sampleWaiting && !s.battery.pending){sampleWaiting=false;calibrationLocked=false;}showBattery(s.battery);}catch(e){document.querySelector('#status').textContent='Ryšys nutrūko arba įrenginys miega. Prisijungimui paspauskite RESET.'}}
+setInterval(status,2000);status();
+document.querySelector('#ota').onsubmit=e=>{e.preventDefault();updating=true;const b=e.target.querySelector('button');b.disabled=true;const x=new XMLHttpRequest();x.open('POST','/update');x.timeout=180000;x.upload.onprogress=e=>{if(e.lengthComputable)document.querySelector('#progress').value=e.loaded/e.total*100};x.onload=()=>{msg.textContent=x.responseText;updating=false;b.disabled=false};x.onerror=x.ontimeout=()=>{msg.textContent='Įkėlimas nutrūko. Patikrinkite ryšį ir bandykite dar kartą.';updating=false;b.disabled=false};x.send(new FormData(e.target));};
+</script></html>)HTML";
 
 String buildMainPage()
 {
-  String page;
-  page.reserve(7000);
-
-  page += R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TickrMeter Clock</title>
-<style>
-  body{
-    margin:0;
-    padding:18px;
-    font-family:Arial,sans-serif;
-    background:#111;
-    color:#eee;
-  }
-  .wrap{
-    max-width:560px;
-    margin:auto;
-  }
-  .card{
-    background:#1d1d1d;
-    border:1px solid #333;
-    border-radius:14px;
-    padding:18px;
-    margin-bottom:14px;
-  }
-  h2,h3{margin-top:0}
-  .status{
-    display:grid;
-    grid-template-columns:1fr 1fr;
-    gap:8px;
-    font-size:14px;
-  }
-  label{
-    display:block;
-    margin:12px 0 6px;
-    color:#bbb;
-  }
-  input[type=text],
-  input[type=password],
-  input[type=time],
-  input[type=number]{
-    width:100%;
-    box-sizing:border-box;
-    padding:11px;
-    font-size:16px;
-    border:1px solid #555;
-    border-radius:8px;
-    background:#0e0e0e;
-    color:#fff;
-  }
-  .switchrow{
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:16px;
-    padding:10px 0;
-    border-bottom:1px solid #333;
-  }
-  input[type=checkbox]{
-    width:24px;
-    height:24px;
-  }
-  button,.btn,input[type=submit]{
-    display:inline-block;
-    box-sizing:border-box;
-    min-height:44px;
-    padding:10px 14px;
-    margin:5px 4px 5px 0;
-    border:0;
-    border-radius:8px;
-    font-size:15px;
-    background:#e8e8e8;
-    color:#111;
-    text-decoration:none;
-    cursor:pointer;
-  }
-  .primary{
-    width:100%;
-    margin-top:16px;
-    font-weight:bold;
-  }
-  .muted{
-    color:#999;
-    font-size:13px;
-  }
-</style>
-</head>
-<body>
-<div class="wrap">
-
-<div class="card">
-<h2>TickrMeter Clock</h2>
-<div class="status">
-<div>Time</div><div><b>)HTML";
-
-  page += currentTimeString();
-
-  page += R"HTML(</b></div>
-<div>Home Wi-Fi</div><div><b>)HTML";
-
-  page += (WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE");
-
-  page += R"HTML(</b></div>
-<div>STA IP</div><div>)HTML";
-
-  page += WiFi.localIP().toString();
-
-  page += R"HTML(</div>
-<div>OTA AP</div><div>192.168.4.1</div>
-</div>
-</div>
-
-<form method="POST" action="/save">
-
-<div class="card">
-<h3>Clock options</h3>
-
-<div class="switchrow">
-<span>RGB LED effects</span>
-<input type="checkbox" name="led" )HTML";
-
-  if (ledEnabled) page += "checked";
-
-  page += R"HTML(>
-</div>
-
-<div class="switchrow">
-<span>Beep every minute</span>
-<input type="checkbox" name="minbeep" )HTML";
-
-  if (minuteBeepEnabled) page += "checked";
-
-  page += R"HTML(>
-</div>
-
-<div class="switchrow">
-<span>Alarm enabled</span>
-<input type="checkbox" name="alarm" )HTML";
-
-  if (alarmEnabled) page += "checked";
-
-  page += R"HTML(>
-</div>
-
-<label>Alarm time</label>
-<input type="time" name="alarmtime" value=")HTML";
-
-  page += alarmTimeString();
-
-  page += R"HTML(">
-
-<label>Alarm duration, seconds</label>
-<input type="number" name="alarmsec" min="5" max="120" value=")HTML";
-
-  page += String(alarmDurationSec);
-
-  page += R"HTML(">
-</div>
-
-<div class="card">
-<h3>Home Wi-Fi</h3>
-
-<label>SSID</label>
-<input type="text" name="ssid" maxlength="32" value=")HTML";
-
-  page += htmlEscape(wifiSsid);
-
-  page += R"HTML(">
-
-<label>Password</label>
-<input type="password" name="pass" maxlength="64"
-       placeholder="Leave blank to keep current password">
-
-<p class="muted">
-TickrMeter-CUSTOM OTA access point stays enabled even if home Wi-Fi fails.
-</p>
-
-<input class="primary" type="submit" value="SAVE SETTINGS + RESTART">
-</div>
-
-</form>
-
-<div class="card">
-<h3>Tests</h3>
-<a class="btn" href="/test-led">Test RGB</a>
-<a class="btn" href="/test-beep">Test beep</a>
-<a class="btn" href="/test-alarm">Test alarm 3s</a>
-<a class="btn" href="/refresh">Refresh screen</a>
-</div>
-
-<div class="card">
-<h3>Firmware update</h3>
-<form method="POST" action="/update" enctype="multipart/form-data">
-<input type="file" name="update" accept=".bin" required>
-<br><br>
-<input type="submit" value="UPLOAD .BIN">
-</form>
-</div>
-
-</div>
-</body>
-</html>
-)HTML";
-
-  return page;
+  String p(FPSTR(PAGE));
+  p.replace("%TITLE%", htmlEscape(screenTitle));
+  p.replace("%LED%", ledEnabled ? "checked" : "");
+  p.replace("%BEEP%", minuteBeepEnabled ? "checked" : "");
+  p.replace("%ALARM%", alarmEnabled ? "checked" : "");
+  p.replace("%TIME%", alarmTimeString());
+  p.replace("%SECONDS%", String(alarmDurationSec));
+  p.replace("%SSID%", htmlEscape(wifiSsid));
+  p.replace("%PIN32%", batteryPin == 32 ? "selected" : "");
+  p.replace("%PIN33%", batteryPin == 33 ? "selected" : "");
+  p.replace("%EMPTY%", String(batteryEmptyV, 2));
+  p.replace("%FULL%", String(batteryFullV, 2));
+  return p;
 }
 
+bool decimal(const String& s)
+{
+  if (!s.length()) return false;
+  for (size_t i=0;i<s.length();++i) if (s[i]<'0'||s[i]>'9') return false;
+  return true;
+}
+
+bool parseVoltage(String value, float& result)
+{
+  value.trim(); value.replace(',', '.');
+  if (!value.length() || value.length() > 10) return false;
+  bool dot = false;
+  for (size_t i=0; i<value.length(); ++i) {
+    if (value[i] == '.' && !dot) { dot = true; continue; }
+    if (value[i] < '0' || value[i] > '9') return false;
+  }
+  char* end; result = strtof(value.c_str(), &end);
+  return *end == '\0' && isfinite(result) && result >= 2.0f && result <= 6.0f;
+}
+
+String batteryJson()
+{
+  String json = "{\"pin\":" + String(batteryPin) + ",\"mv\":" + String(batteryMilliVolts);
+  json += ",\"valid\":"; json += batteryValid ? "true" : "false";
+  json += ",\"percent\":" + String(batteryPercent) + ",\"id\":" + String(batterySampleId);
+  json += ",\"age\":" + String((uint32_t)(millis()-batterySampleAt));
+  json += ",\"pending\":"; json += batterySampleRequested ? "true" : "false";
+  json += ",\"channels\":[";
+  for (int i=0; i<2; ++i) {
+    if (i) json += ',';
+    json += "{\"nominal\":" + String(batteryNominalMv[i]);
+    json += ",\"corrected\":" + String((uint32_t)(batteryNominalMv[i]*batteryCorrection[i]+0.5f));
+    json += ",\"factor\":" + String(batteryCorrection[i], 6) + ",\"valid\":";
+    json += batteryChannelValid[i] ? "true" : "false";
+    json += '}';
+  }
+  json += "]}"; return json;
+}
+
+bool wifiChanged = false;
+uint8_t pendingTest = 0;
 void startWebServer()
 {
-  server.on("/", HTTP_GET, []()
-  {
-    server.send(200, "text/html", buildMainPage());
+  server.on("/", HTTP_GET, [] { server.send(200,"text/html; charset=utf-8",buildMainPage()); });
+  server.on("/status", HTTP_GET, [] {
+    uint32_t elapsed=millis()-webStarted;
+    String json="{\"time\":\""+currentTimeString()+"\",\"connected\":";
+    json += WiFi.status()==WL_CONNECTED ? "true" : "false";
+    json += ",\"valid\":"; json += time(nullptr)>VALID_TIME ? "true" : "false";
+    json += ",\"ip\":\""+WiFi.localIP().toString()+"\",\"remaining\":";
+    json += String(elapsed<WEB_WINDOW_MS ? (WEB_WINDOW_MS-elapsed+999)/1000 : 0);
+    json += ",\"battery\":" + batteryJson() + "}";
+    server.sendHeader("Cache-Control","no-store"); server.send(200,"application/json",json);
   });
-
-  server.on("/save", HTTP_POST, []()
-  {
-    ledEnabled = server.hasArg("led");
-    minuteBeepEnabled = server.hasArg("minbeep");
-    alarmEnabled = server.hasArg("alarm");
-
-    if (server.hasArg("alarmtime"))
-    {
-      String a = server.arg("alarmtime");
-
-      if (a.length() >= 5 && a.charAt(2) == ':')
-      {
-        int h = a.substring(0, 2).toInt();
-        int m = a.substring(3, 5).toInt();
-
-        if (h >= 0 && h <= 23 && m >= 0 && m <= 59)
-        {
-          alarmHour = h;
-          alarmMinute = m;
-        }
+  server.on("/battery/save", HTTP_POST, [] {
+    if (uploadActive) {server.send(409,"text/plain","Vyksta OTA");return;}
+    String pin = server.arg("pin"), operation = server.arg("operation");
+    if ((pin != "32" && pin != "33") || (operation != "apply" && operation != "reset")) {
+      server.send(400,"text/plain; charset=utf-8","Pasirinkite GPIO32 arba GPIO33.");return;
+    }
+    int channel = pin == "33" ? 1 : 0;
+    float empty, full;
+    if (!parseVoltage(server.arg("empty"),empty) || !parseVoltage(server.arg("full"),full)
+        || lroundf(full*1000)-lroundf(empty*1000) < 100) {
+      server.send(400,"text/plain; charset=utf-8","Pilnos baterijos įtampa turi viršyti tuščios bent 0.10 V (ribos 2–6 V).");return;
+    }
+    float correction = batteryCorrection[channel];
+    String real = server.arg("real"); real.trim();
+    if (operation == "reset") correction = 1.0f;
+    else if (real.length()) {
+      float voltage; String id = server.arg("sample");
+      if (!parseVoltage(real,voltage) || !decimal(id) || id.length()>10) {
+        server.send(400,"text/plain; charset=utf-8","Įveskite tikrą multimetro įtampą (2–6 V).");return;
+      }
+      if (batterySampleRequested || strtoul(id.c_str(),nullptr,10) != batterySampleId
+          || !batteryChannelValid[channel] || millis()-batterySampleAt > 60000) {
+        server.send(409,"text/plain; charset=utf-8","Matavimas pasenęs arba negalioja. Pamatuokite iš naujo ir pakartokite kalibravimą.");return;
+      }
+      // Always derive from the uncorrected sample; recalibration is not compounded.
+      correction = voltage * 1000.0f / batteryNominalMv[channel];
+      if (!isfinite(correction) || correction < 0.25f || correction > 4.0f) {
+        server.send(400,"text/plain; charset=utf-8","Pataisa per didelė. Patikrinkite kanalą ir multimetro rodmenį.");return;
       }
     }
-
-    if (server.hasArg("alarmsec"))
-    {
-      alarmDurationSec =
-        constrain(server.arg("alarmsec").toInt(), 5, 120);
+    batteryPin = channel == 0 ? 32 : 33; batteryCorrection[channel] = correction;
+    batteryEmptyV = empty; batteryFullV = full; updateBatteryValue();
+    bool stored = prefs.putUChar("batPin",batteryPin) == 1;
+    stored = (prefs.putFloat("batCal32",batteryCorrection[0]) == 4) && stored;
+    stored = (prefs.putFloat("batCal33",batteryCorrection[1]) == 4) && stored;
+    stored = (prefs.putFloat("batEmpty",batteryEmptyV) == 4) && stored;
+    stored = (prefs.putFloat("batFull",batteryFullV) == 4) && stored;
+    refreshRequested = true;
+    server.send(stored ? 200 : 500,"text/plain; charset=utf-8", stored
+      ? "Baterijos nustatymai išsaugoti. Ekranas bus atnaujintas."
+      : "Nustatymai taikomi, bet jų išsaugoti nepavyko.");
+  });
+  server.on("/save", HTTP_POST, [] {
+    if(uploadActive){server.send(409,"text/plain","Vyksta OTA");return;}
+    String a=server.arg("alarmtime"), dur=server.arg("alarmsec");
+    String title=server.arg("title"), ssid=server.arg("ssid"), pass=server.arg("pass");
+    bool good=a.length()==5 && a[2]==':' && decimal(a.substring(0,2)) && decimal(a.substring(3))
+      && a.substring(0,2).toInt()<24 && a.substring(3).toInt()<60
+      && dur.length()<=3 && decimal(dur) && dur.toInt()>=5 && dur.toInt()<=120
+      && ssid.length()<=32 && title.length()>0 && title.length()<=18;
+    for(size_t i=0;i<title.length();++i) if(title[i]<32 || title[i]>126) good=false;
+    // Measure actual glyph bounds: even 18 wide letters must fit the header.
+    display.setFont(&FreeSansBold9pt7b);
+    int16_t bx,by; uint16_t bw,bh; display.getTextBounds(title,0,0,&bx,&by,&bw,&bh);
+    if(bw>138) good=false;
+    if(pass.length() && !(pass.length()>=8 && pass.length()<=63)) {
+      bool hex=pass.length()==64;
+      for(size_t i=0;i<pass.length();++i) if(!isxdigit((unsigned char)pass[i])) hex=false;
+      if(!hex) good=false;
     }
-
-    if (server.hasArg("ssid"))
-    {
-      String newSsid = server.arg("ssid");
-      newSsid.trim();
-
-      if (newSsid.length() > 0)
-        wifiSsid = newSsid;
-    }
-
-    // Blank password means: preserve current password.
-    if (server.hasArg("pass"))
-    {
-      String newPass = server.arg("pass");
-
-      if (newPass.length() > 0)
-        wifiPass = newPass;
-    }
-
-    saveSettings();
-
-    server.send(
-      200,
-      "text/html",
-      "<html><body style='font-family:Arial;text-align:center'>"
-      "<h2>Settings saved</h2>"
-      "<p>TickrMeter is restarting...</p>"
-      "</body></html>"
-    );
-
-    delay(1000);
-    ESP.restart();
+    if(!good){server.send(400,"text/plain; charset=utf-8","Neteisingi nustatymai: patikrinkite laiką, trukmę, antraštės plotį ir Wi-Fi slaptažodį.");return;}
+    String nextPass=server.hasArg("openwifi") ? "" : (pass.length() ? pass : wifiPass);
+    wifiChanged=(ssid!=wifiSsid || nextPass!=wifiPass);
+    wifiSsid=ssid; wifiPass=nextPass; screenTitle=title;
+    ledEnabled=server.hasArg("led"); minuteBeepEnabled=server.hasArg("minbeep"); alarmEnabled=server.hasArg("alarm");
+    alarmHour=a.substring(0,2).toInt();alarmMinute=a.substring(3).toInt();alarmDurationSec=dur.toInt();
+    saveSettings(); refreshRequested=true;
+    server.send(200,"text/plain; charset=utf-8","Nustatymai išsaugoti. Ekranas bus atnaujintas.");
   });
-
-  server.on("/test-led", HTTP_GET, []()
-  {
-    manualLedTest();
-    server.sendHeader("Location", "/");
-    server.send(303);
+  server.on("/action", HTTP_POST, [] {
+    if(uploadActive){server.send(409,"text/plain","Vyksta OTA");return;}
+    String a=server.arg("action");
+    if(a=="led") pendingTest=1;
+    else if(a=="beep") pendingTest=2;
+    else if(a=="alarm") runAlarm(3);
+    else if(a=="stop") stopAlarm();
+    else if(a=="refresh") refreshRequested=true;
+    else if(a=="battery-sample") batterySampleRequested=true;
+    else {server.send(400,"text/plain","Nezinomas veiksmas");return;}
+    server.send(202,"text/plain; charset=utf-8","Komanda priimta.");
   });
-
-  server.on("/test-beep", HTTP_GET, []()
-  {
-    // Manual test ignores minute-beep setting.
-    buzzerToneOnce(2200, 100);
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
-
-  server.on("/test-alarm", HTTP_GET, []()
-  {
-    runAlarm(3);
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
-
-  server.on("/refresh", HTTP_GET, []()
-  {
-    time_t now = time(nullptr);
-    struct tm t;
-
-    if (now > 1700000000 && localtime_r(&now, &t))
-      drawClock(t);
-
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
-
-  // Keep old /update URL useful.
-  server.on("/update", HTTP_GET, []()
-  {
-    server.sendHeader("Location", "/");
-    server.send(303);
-  });
-
-  server.on(
-    "/update",
-    HTTP_POST,
-
-    []()
-    {
-      if (Update.hasError())
-      {
-        server.send(500, "text/plain", "UPDATE FAILED");
+  server.on("/update",HTTP_POST, [] {
+    uploadActive=false;
+    bool succeeded=uploadOK && !Update.hasError(); uploadOK=false;
+    if(!succeeded) {server.send(400,"text/plain; charset=utf-8","OTA nepavyko. Patikrinkite .bin ir OTA skaidinių lentelę.");return;}
+    server.send(200,"text/plain; charset=utf-8","OTA baigta. Įrenginys persikrauna.");
+    restartPending=true; restartAt=millis();
+  }, [] {
+    HTTPUpload& u=server.upload();uploadActivity=millis();
+    if(u.status==UPLOAD_FILE_START){
+      uploadOK=false;stopAlarm();
+      if(uploadActive) Update.abort();
+      uploadActive=true;
+      if(!u.filename.endsWith(".bin") || !Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.abort(); uploadActive=false;
       }
-      else
-      {
-        server.send(200, "text/plain", "UPDATE OK - REBOOT");
-        delay(1000);
-        ESP.restart();
-      }
-    },
-
-    []()
-    {
-      HTTPUpload& upload = server.upload();
-
-      if (upload.status == UPLOAD_FILE_START)
-      {
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN))
-          Update.printError(Serial);
-      }
-      else if (upload.status == UPLOAD_FILE_WRITE)
-      {
-        if (
-          Update.write(
-            upload.buf,
-            upload.currentSize
-          ) != upload.currentSize
-        )
-        {
-          Update.printError(Serial);
-        }
-      }
-      else if (upload.status == UPLOAD_FILE_END)
-      {
-        if (!Update.end(true))
-          Update.printError(Serial);
-      }
-    }
-  );
-
-  // Captive portal: any unknown URL goes back to settings page.
-  server.onNotFound([]()
-  {
-    server.sendHeader("Location", "http://192.168.4.1/", true);
-    server.send(302, "text/plain", "");
+    } else if(u.status==UPLOAD_FILE_WRITE){
+      if(uploadActive && Update.write(u.buf,u.currentSize)!=u.currentSize){Update.abort();uploadActive=false;}
+    } else if(u.status==UPLOAD_FILE_END){
+      if(uploadActive) uploadOK=u.totalSize>0 && Update.end(true);
+      if(!uploadOK) Update.abort();
+    } else if(u.status==UPLOAD_FILE_ABORTED){Update.abort();uploadActive=false;uploadOK=false;}
   });
-
+  server.onNotFound([] {server.sendHeader("Location","http://192.168.4.1/",true);server.send(302,"text/plain","");});
   server.begin();
 }
 
-// ============================================================
-// SETUP
-// ============================================================
+void serviceWeb()
+{
+  if (!webActive) return;
+  if (!uploadActive && !restartPending && ClockLogic::windowExpired(millis(),webStarted)) {
+    stopWeb(); WiFi.disconnect(true,false); WiFi.mode(WIFI_OFF); refreshRequested=true; return;
+  }
+  dnsServer.processNextRequest(); server.handleClient();
+}
+
+void stopWeb()
+{
+  if (!webActive) return;
+  dnsServer.stop(); server.stop(); WiFi.softAPdisconnect(true); webActive=false;
+}
+
+void sleepToNextMinute()
+{
+  stopWeb(); WiFi.disconnect(true,false); WiFi.mode(WIFI_OFF);
+  stopAlarm(); digitalWrite(EPD_POWER,HIGH);
+  digitalWrite(PIN_BAT_EN, LOW);
+  // Preserve output levels: EPD off, LEDs/audio off, battery divider OFF.
+  const int held[]={EPD_POWER,LED_RED,LED_GREEN,LED_BLUE,BUZZER_STBY,AUDIO_PIN,PIN_BAT_EN};
+  for(int pin:held) gpio_hold_en((gpio_num_t)pin);
+  gpio_deep_sleep_hold_en();
+  struct timeval tv; gettimeofday(&tv,nullptr);
+  uint64_t us=ClockLogic::nextMinuteUs(tv.tv_sec,tv.tv_usec);
+  esp_sleep_enable_timer_wakeup(us);
+  Serial.flush(); esp_deep_sleep_start();
+}
+
+void showNoTime()
+{
+  drawing=true;sampleBattery();epdPowerOn();SPI.begin(EPD_SCK,-1,EPD_MOSI,EPD_CS);
+  display.init(115200);display.setRotation(3);display.setFullWindow();display.setTextWrap(false);
+  display.epd2.setBusyCallback([](const void*) {serviceWeb();delay(1);});
+  display.firstPage();do {
+    display.fillScreen(GxEPD_WHITE);display.setTextColor(GxEPD_BLACK);
+    drawHeader();
+    centeredText("LAIKAS NESINCHRONIZUOTAS",0,296,44,&FreeSans9pt7b);
+    centeredText("--:--",0,296,75,&FreeSansBold12pt7b);
+    centeredText(webActive ? "Wi-Fi: TickrMeter-CUSTOM" : "Nustatymams spauskite RESET",0,296,100,&FreeSans9pt7b);
+    centeredText(webActive ? "192.168.4.1 / 5 min. po RESET" : "NTP bus bandomas vel",0,296,123,&FreeSans9pt7b);
+  }while(display.nextPage());display.hibernate();epdPowerOff();drawing=false;
+}
 
 void setup()
 {
   Serial.begin(115200);
-  delay(500);
-
-  pinMode(LED_RED, OUTPUT);
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_BLUE, OUTPUT);
-  ledsOff();
-
-  pinMode(BUZZER_STBY, OUTPUT);
-  digitalWrite(BUZZER_STBY, LOW);
-
-  pinMode(AUDIO_PIN, OUTPUT);
-  digitalWrite(AUDIO_PIN, LOW);
-
-  pinMode(EPD_POWER, OUTPUT);
-  digitalWrite(EPD_POWER, HIGH);
-
-  loadSettings();
-
-  // OTA AP is always available.
-  WiFi.mode(WIFI_AP_STA);
-
-  // Force a known AP address.
-  WiFi.softAPConfig(apIP, apGateway, apSubnet);
-  WiFi.softAP(OTA_AP_SSID, OTA_AP_PASS);
-
-  // Captive portal DNS.
-  dnsServer.start(53, "*", apIP);
-
-  startWebServer();
-
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
-
-  connectHomeWifi();
-  configureNtp();
-  waitForTime(10000);
-
-  // Startup feedback obeys settings.
-  minuteLedTest();
-  shortMinuteBeep();
-
-  time_t now = time(nullptr);
-  struct tm t;
-
-  if (now > 1700000000 && localtime_r(&now, &t))
-  {
-    drawClock(t);
-    lastShownMinute = t.tm_min;
+  initBattery();
+  bool timerWake=esp_sleep_get_wakeup_cause()==ESP_SLEEP_WAKEUP_TIMER;
+  const int outputs[]={EPD_POWER,LED_RED,LED_GREEN,LED_BLUE,BUZZER_STBY,AUDIO_PIN};
+  for(int pin:outputs){pinMode(pin,OUTPUT);digitalWrite(pin,(pin==BUZZER_STBY || pin==AUDIO_PIN)?LOW:HIGH);gpio_hold_dis((gpio_num_t)pin);}
+  gpio_deep_sleep_hold_dis();
+  loadSettings();setenv("TZ",TZ_LT,1);tzset();
+  if(!timerWake){lastShownStamp=0;lastAlarmDay=-1;lastNtpSync=0;}
+  if(!timerWake){
+    WiFi.mode(WIFI_AP_STA);WiFi.softAPConfig(apIP,apGateway,apSubnet);
+    WiFi.softAP(OTA_AP_SSID,OTA_AP_PASS);dnsServer.start(53,"*",apIP);
+    webActive=true;webStarted=millis();startWebServer();
   }
+  time_t now=time(nullptr);
+  if(!timerWake || now<=VALID_TIME || lastNtpSync==0 || now<lastNtpSync || now-lastNtpSync>=3600){
+    if(timerWake) WiFi.mode(WIFI_STA);
+    connectHomeWifi();
+    if(WiFi.status()==WL_CONNECTED){configureNtp();waitForTime(8000);}
+    if(ntpSynced){lastNtpSync=time(nullptr);ntpSynced=false;}
+    if(!webActive){WiFi.disconnect(true,false);WiFi.mode(WIFI_OFF);}
+  }
+  if(time(nullptr)<=VALID_TIME && !timerWake) showNoTime();
 }
-
-// ============================================================
-// LOOP
-// ============================================================
 
 void loop()
 {
-  dnsServer.processNextRequest();
-  server.handleClient();
-
-  if (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - lastReconnectTry > 60000
-  )
-  {
-    lastReconnectTry = millis();
-    connectHomeWifi();
+  serviceWeb();
+  if(restartPending){if(millis()-restartAt>=1000) ESP.restart();delay(1);return;}
+  if(uploadActive){
+    if(millis()-uploadActivity>90000){Update.abort();uploadActive=false;uploadOK=false;}
+    else {delay(1);return;}
   }
-
-  time_t now = time(nullptr);
-
-  if (now > 1700000000)
-  {
-    struct tm t;
-
-    if (localtime_r(&now, &t))
-    {
-      bool newMinute = (t.tm_min != lastShownMinute);
-
-      int alarmStamp =
-        t.tm_yday * 1440 +
-        t.tm_hour * 60 +
-        t.tm_min;
-
-      bool alarmNow =
-        alarmEnabled &&
-        t.tm_hour == alarmHour &&
-        t.tm_min == alarmMinute &&
-        alarmStamp != lastAlarmStamp;
-
-      if (newMinute)
-      {
-        lastShownMinute = t.tm_min;
-
-        minuteLedTest();
-
-        if (alarmNow)
-        {
-          lastAlarmStamp = alarmStamp;
-          runAlarm(alarmDurationSec);
-        }
-        else
-        {
-          shortMinuteBeep();
-        }
-
-        drawClock(t);
-      }
+  if (batterySampleRequested) {sampleBattery();batterySampleRequested=false;}
+  if(webActive && ClockLogic::windowExpired(millis(),webStarted)){stopWeb();WiFi.disconnect(true,false);WiFi.mode(WIFI_OFF);refreshRequested=true;}
+  if(ntpSynced){lastNtpSync=time(nullptr);ntpSynced=false;}
+  if(wifiChanged){wifiChanged=false;WiFi.disconnect(false,false);if(wifiSsid.length())WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());configureNtp();}
+  if(webActive && WiFi.status()!=WL_CONNECTED && millis()-lastReconnectTry>60000){lastReconnectTry=millis();if(wifiSsid.length())WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());}
+  if(pendingTest && !drawing){uint8_t test=pendingTest;pendingTest=0;if(test==1)manualLedTest();else buzzerToneOnce(2200,100);}
+  time_t now=time(nullptr);struct tm t;
+  if(now>VALID_TIME && localtime_r(&now,&t)){
+    int day=ClockLogic::dateStamp(t.tm_year+1900,t.tm_yday);
+    if(alarmEnabled && t.tm_hour==alarmHour && t.tm_min==alarmMinute && day!=lastAlarmDay){lastAlarmDay=day;runAlarm(alarmDurationSec);}
+    serviceAlarm();
+    time_t stamp=now/60;
+    if(!alarmRunning && (stamp!=lastShownStamp || refreshRequested)){
+      bool newMinute=stamp!=lastShownStamp;
+      lastShownStamp=stamp;refreshRequested=false;
+      if(newMinute){minuteLedTest();shortMinuteBeep();}
+      drawClock(t);
     }
-  }
-
-  delay(50);
+  } else if(refreshRequested){refreshRequested=false;showNoTime();}
+  serviceAlarm();
+  if(!webActive && !alarmRunning && !restartPending) sleepToNextMinute();
+  delay(5);
 }
+

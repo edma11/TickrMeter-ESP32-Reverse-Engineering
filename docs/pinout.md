@@ -18,6 +18,12 @@ These connections were independently identified and tested on one **TickrMeter R
 | RGB LED blue | 21 | Active LOW |
 | Buzzer / audio STBY | 17 | HIGH enables audio stage |
 | Audio signal | 25 | Tested with `tone()` |
+| Battery divider ADC | 32 | ADC1_CH4; battery voltage through nominal approximately 10 kΩ / 10 kΩ divider; owner confirmed working on 2026-10-11 |
+| USB divider ADC | 33 | ADC1_CH5; USB supply voltage through divider; owner reported approximately 5 V after compensation on 2026-10-11 |
+| Divider MOSFET enable | 4 | HIGH enables measurement; LOW disables it and is held during deep sleep; call `pinMode(OUTPUT)` before `digitalWrite()` |
+
+Battery measurements, known limitations, and future firmware integration:
+[`battery-adc.md`](battery-adc.md).
 
 ## E-paper FPC observations
 
